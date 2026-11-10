@@ -1,0 +1,18 @@
+[package]
+name = "scanner-rs"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Network scanner for Windows"
+repository = "https://github.com/Nestorm18/scanner-rs"
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "clipboard"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+regex = { version = "1", default-features = false, features = ["perf", "std"] }
+rfd = "=0.15.4"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

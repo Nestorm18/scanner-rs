@@ -1,0 +1,12 @@
+/target/
+/artifacts/
+/service_probes
+
+*.pdb
+*.log
+*.tmp
+
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
