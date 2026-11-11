@@ -1,8 +1,9 @@
 <p align="center">
-  <img src="assets/icon.png" width="96" alt="scanner-rs">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.png">
+    <img src="assets/logo.png" width="300" height="55" alt="scanner-rs">
+  </picture>
 </p>
-
-<h1 align="center">scanner-rs</h1>
 
 <p align="center">
   Escáner de red para Windows, rápido y sencillo. Un solo <code>.exe</code>, sin instalación.
