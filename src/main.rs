@@ -6,13 +6,14 @@ mod gui;
 use scanner_rs::cli::{parse_args, Verbosity};
 use scanner_rs::output::{render_text, render_xml};
 use scanner_rs::probes::ProbeDatabase;
-use scanner_rs::scanner::{scan_targets, ScanOptions};
+use scanner_rs::scanner::{scan_progressive, ScanEvent, ScanOptions};
 use scanner_rs::source::parse_source;
 use scanner_rs::targets::Ipv4Range;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::process::ExitCode;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 fn run_cli() -> ExitCode {
@@ -43,11 +44,17 @@ fn run_cli() -> ExitCode {
         }
     }
 
-    let targets = ranges.into_iter().flat_map(|range| range.into_iter());
+    let targets: Vec<_> = ranges
+        .into_iter()
+        .flat_map(|range| range.into_iter())
+        .collect();
     let mut options = ScanOptions::default();
     options.max_workers = std::thread::available_parallelism()
-        .map(|parallelism| parallelism.get().saturating_mul(4).clamp(4, 64))
-        .unwrap_or(16);
+        .map(|parallelism| parallelism.get().saturating_mul(8).clamp(32, 128))
+        .unwrap_or(64);
+    if config.verbosity == Verbosity::HostsOnly {
+        options.ports.clear();
+    }
     options.collect_http_metadata = config.verbosity != Verbosity::HostsOnly;
     options.resolve_hostnames = true;
     options.collect_windows_enrichment = config.verbosity == Verbosity::GroupedServices;
@@ -57,7 +64,19 @@ fn run_cli() -> ExitCode {
         Err(error) => eprintln!("warning: service probe database could not be loaded: {error}"),
     }
 
-    let results = scan_targets(targets, options);
+    // Only live hosts are reported; each one arrives once its details are done.
+    let mut results = Vec::new();
+    scan_progressive(
+        targets,
+        options,
+        Arc::new(AtomicBool::new(false)),
+        |event| {
+            if let ScanEvent::Detailed(host) = event {
+                results.push(host);
+            }
+        },
+    );
+    results.sort_by_key(|result| result.address);
     let rendered = if config.output_xml {
         render_xml(&results)
     } else {

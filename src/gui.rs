@@ -7,14 +7,15 @@ use scanner_rs::cli::Verbosity;
 use scanner_rs::output::{render_csv, render_html, render_text, render_xml};
 use scanner_rs::platform::{local_networks, LocalNetwork};
 use scanner_rs::probes::ProbeDatabase;
-use scanner_rs::scanner::{scan_progressive, HostResult, ScanEvent, ScanOptions};
+use scanner_rs::scanner::{scan_progressive, HostResult, ScanEvent, ScanOptions, DEFAULT_PORTS};
 use scanner_rs::source::parse_source;
-use scanner_rs::targets::Ipv4Range;
+use scanner_rs::targets::{parse_ports, Ipv4Range};
 use scanner_rs::vendor;
 use std::cmp::Ordering as CmpOrdering;
 use std::fs;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
@@ -31,6 +32,8 @@ const TEXT: Color32 = Color32::from_rgb(17, 24, 39);
 const MUTED: Color32 = Color32::from_rgb(107, 114, 128);
 const ROW_HEIGHT: f32 = 34.0;
 const SEMIBOLD: &str = "semibold";
+/// Largest number of addresses accepted in one scan.
+const MAX_TARGETS: u64 = 65_536;
 
 pub fn run() -> eframe::Result<()> {
     let icon = egui::IconData {
@@ -190,6 +193,7 @@ struct ScannerApp {
     target: String,
     depth: ScanDepth,
     filter: String,
+    extra_ports: String,
     networks: Vec<LocalNetwork>,
     rows: Vec<Row>,
     sort: (Column, bool),
@@ -218,6 +222,7 @@ impl ScannerApp {
             target,
             depth: ScanDepth::Normal,
             filter: String::new(),
+            extra_ports: String::new(),
             networks,
             rows: Vec::new(),
             sort: (Column::Address, true),
@@ -237,19 +242,22 @@ impl ScannerApp {
             return Err("Escribe una IP o un rango".to_owned());
         }
 
-        let targets: Vec<Ipv4Addr> = if let Ok(range) = input.parse::<Ipv4Range>() {
-            range.into_iter().collect()
+        let ranges: Vec<Ipv4Range> = if let Ok(range) = input.parse::<Ipv4Range>() {
+            vec![range]
         } else if Path::new(input).is_file() {
             let contents = fs::read_to_string(input)
                 .map_err(|error| format!("No se pudo leer el archivo: {error}"))?;
-            parse_source(&contents)
-                .map_err(|error| error.to_string())?
-                .into_iter()
-                .flat_map(|range| range.into_iter())
-                .collect()
+            parse_source(&contents).map_err(|error| error.to_string())?
         } else {
             return Err("IP, rango o archivo no válido".to_owned());
         };
+        if ranges.iter().map(|range| range.len()).sum::<u64>() > MAX_TARGETS {
+            return Err("Rango demasiado grande (máximo 65 536 direcciones)".to_owned());
+        }
+        let targets: Vec<Ipv4Addr> = ranges
+            .into_iter()
+            .flat_map(|range| range.into_iter())
+            .collect();
 
         if targets.is_empty() {
             Err("No hay direcciones para escanear".to_owned())
@@ -261,6 +269,13 @@ impl ScannerApp {
     fn start_scan(&mut self) {
         let targets = match self.collect_targets() {
             Ok(targets) => targets,
+            Err(error) => {
+                self.status = Status::Error(error);
+                return;
+            }
+        };
+        let extra_ports = match parse_ports(&self.extra_ports) {
+            Ok(ports) => ports,
             Err(error) => {
                 self.status = Status::Error(error);
                 return;
@@ -295,8 +310,13 @@ impl ScannerApp {
             };
             if depth == ScanDepth::Quick {
                 options.ports.clear();
-            } else if let Ok(Some(database)) = ProbeDatabase::load_default() {
-                options.probe_database = Some(Arc::new(database));
+            } else {
+                options.ports.extend(extra_ports);
+                options.ports.sort_unstable();
+                options.ports.dedup();
+                if let Ok(Some(database)) = ProbeDatabase::load_default() {
+                    options.probe_database = Some(Arc::new(database));
+                }
             }
 
             let events = sender.clone();
@@ -448,6 +468,7 @@ impl ScannerApp {
             }
 
             ui.add_enabled_ui(!running, |ui| segmented(ui, &mut self.depth));
+            ui.add_enabled_ui(!running, |ui| self.ports_menu(ui));
             ui.add_enabled_ui(!running, |ui| self.targets_menu(ui));
 
             let field = egui::TextEdit::singleline(&mut self.target)
@@ -460,6 +481,36 @@ impl ScannerApp {
                 self.start_scan();
             }
         });
+    }
+
+    fn ports_menu(&mut self, ui: &mut egui::Ui) {
+        let custom = !self.extra_ports.trim().is_empty();
+        let icon = RichText::new("⚙")
+            .size(17.0)
+            .color(if custom { ACCENT } else { TEXT });
+        let response = ui
+            .add(egui::Button::new(icon).min_size(Vec2::new(36.0, 36.0)))
+            .on_hover_text("Puertos");
+        egui::Popup::from_toggle_button_response(&response)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .width(300.0)
+            .show(|ui| {
+                ui.label(semibold("Puertos adicionales", 14.0));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.extra_ports)
+                        .hint_text("22, 8000-8100")
+                        .margin(Vec2::new(8.0, 6.0))
+                        .desired_width(f32::INFINITY),
+                );
+                let note = match parse_ports(&self.extra_ports) {
+                    Ok(_) => (
+                        format!("Se suman a los {} habituales", DEFAULT_PORTS.len()),
+                        MUTED,
+                    ),
+                    Err(error) => (error, DANGER),
+                };
+                ui.label(RichText::new(note.0).size(12.5).color(note.1));
+            });
     }
 
     fn targets_menu(&mut self, ui: &mut egui::Ui) {
@@ -595,17 +646,32 @@ impl ScannerApp {
                 if let Some(column) = header_row(ui, &columns, self.sort) {
                     self.set_sort(column);
                 }
+                let mut message = None;
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show_rows(ui, ROW_HEIGHT, visible.len(), |ui, range| {
                         for &index in &visible[range] {
                             let row = &self.rows[index];
                             let selected = self.selected == Some(row.host.address);
-                            if host_row(ui, &columns, row, selected).clicked() {
+                            let response = host_row(ui, &columns, row, selected);
+                            if response.clicked() {
                                 self.selected = (!selected).then_some(row.host.address);
                             }
+                            if response.double_clicked() {
+                                if let Some(action) = host_actions(&row.host).into_iter().next() {
+                                    message = run_action(ui.ctx(), &row.host, &action);
+                                }
+                            }
+                            response.context_menu(|ui| {
+                                if let Some(text) = actions_menu(ui, &row.host) {
+                                    message = Some(text);
+                                }
+                            });
                         }
                     });
+                if let Some(text) = message {
+                    self.status = Status::Info(text);
+                }
             });
     }
 
@@ -690,8 +756,12 @@ impl eframe::App for ScannerApp {
                         .stroke(Stroke::new(1.0_f32, BORDER)),
                 )
                 .show(ui, |ui| {
-                    if host_details(ui, &host, detailed) {
+                    let (close, message) = host_details(ui, &host, detailed);
+                    if close {
                         self.selected = None;
+                    }
+                    if let Some(text) = message {
+                        self.status = Status::Info(text);
                     }
                 });
         }
@@ -966,8 +1036,9 @@ fn host_row(
 }
 
 /// Returns true when the close button was pressed.
-fn host_details(ui: &mut egui::Ui, host: &HostResult, detailed: bool) -> bool {
+fn host_details(ui: &mut egui::Ui, host: &HostResult, detailed: bool) -> (bool, Option<String>) {
     let mut close = false;
+    let mut message = None;
     ui.horizontal(|ui| {
         ui.label(semibold(&host.address.to_string(), 18.0));
         if let Some(hostname) = &host.hostname {
@@ -981,6 +1052,13 @@ fn host_details(ui: &mut egui::Ui, host: &HostResult, detailed: bool) -> bool {
                 .add(egui::Button::new(RichText::new("×").size(20.0).color(MUTED)).frame(false))
                 .on_hover_text("Cerrar")
                 .clicked();
+            ui.add_space(8.0);
+            // Right-to-left layout: reverse so the main action ends up first.
+            for action in host_actions(host).iter().rev() {
+                if ui.button(action.label()).clicked() {
+                    message = run_action(ui.ctx(), host, action);
+                }
+            }
         });
     });
     ui.add_space(4.0);
@@ -1030,7 +1108,130 @@ fn host_details(ui: &mut egui::Ui, host: &HostResult, detailed: bool) -> bool {
                 detail(ui, "Hora", time);
             }
         });
-    close
+    (close, message)
+}
+
+/// Something the user can do with a found host.
+enum HostAction {
+    Web(String),
+    RemoteDesktop,
+    Shares,
+    Ssh,
+    CopyIp,
+    CopyMac,
+}
+
+impl HostAction {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Web(_) => "Abrir web",
+            Self::RemoteDesktop => "Escritorio remoto",
+            Self::Shares => "Carpetas compartidas",
+            Self::Ssh => "SSH",
+            Self::CopyIp => "Copiar IP",
+            Self::CopyMac => "Copiar MAC",
+        }
+    }
+}
+
+/// Available actions, the most useful first (used for double-click).
+fn host_actions(host: &HostResult) -> Vec<HostAction> {
+    let open = |port: u16| host.services.iter().any(|service| service.port == port);
+    let mut actions = Vec::new();
+    if let Some(url) = web_url(host) {
+        actions.push(HostAction::Web(url));
+    }
+    if open(3389) {
+        actions.push(HostAction::RemoteDesktop);
+    }
+    if open(445) || open(139) {
+        actions.push(HostAction::Shares);
+    }
+    if open(22) {
+        actions.push(HostAction::Ssh);
+    }
+    actions.push(HostAction::CopyIp);
+    if host.mac_address.is_some() {
+        actions.push(HostAction::CopyMac);
+    }
+    actions
+}
+
+fn web_url(host: &HostResult) -> Option<String> {
+    const WEB_PORTS: [(u16, &str); 9] = [
+        (80, "http"),
+        (443, "https"),
+        (8080, "http"),
+        (8443, "https"),
+        (8006, "https"),
+        (8000, "http"),
+        (8081, "http"),
+        (8888, "http"),
+        (81, "http"),
+    ];
+    WEB_PORTS.iter().find_map(|&(port, scheme)| {
+        host.services
+            .iter()
+            .any(|service| service.port == port)
+            .then(|| {
+                let default =
+                    (scheme == "http" && port == 80) || (scheme == "https" && port == 443);
+                if default {
+                    format!("{scheme}://{}/", host.address)
+                } else {
+                    format!("{scheme}://{}:{port}/", host.address)
+                }
+            })
+    })
+}
+
+/// Runs an action; returns a short message for the status line.
+fn run_action(context: &egui::Context, host: &HostResult, action: &HostAction) -> Option<String> {
+    let address = host.address.to_string();
+    let launched = match action {
+        HostAction::Web(url) => Command::new("rundll32")
+            .args(["url.dll,FileProtocolHandler", url])
+            .spawn(),
+        HostAction::RemoteDesktop => Command::new("mstsc").arg(format!("/v:{address}")).spawn(),
+        HostAction::Shares => Command::new("explorer")
+            .arg(format!(r"\\{address}"))
+            .spawn(),
+        HostAction::Ssh => Command::new("cmd")
+            .args(["/c", "start", "", "ssh", &address])
+            .spawn(),
+        HostAction::CopyIp => {
+            context.copy_text(address.clone());
+            return Some(format!("Copiado: {address}"));
+        }
+        HostAction::CopyMac => {
+            let mac = host.mac_address.clone().unwrap_or_default();
+            context.copy_text(mac.clone());
+            return Some(format!("Copiado: {mac}"));
+        }
+    };
+    launched
+        .err()
+        .map(|error| format!("No se pudo abrir: {error}"))
+}
+
+/// Context menu for a row; returns a status message when an action ran.
+fn actions_menu(ui: &mut egui::Ui, host: &HostResult) -> Option<String> {
+    let mut message = None;
+    let actions = host_actions(host);
+    let copies = actions
+        .iter()
+        .position(|action| matches!(action, HostAction::CopyIp))
+        .unwrap_or(0);
+    for (index, action) in actions.iter().enumerate() {
+        if index == copies && index > 0 {
+            ui.separator();
+        }
+        if ui.button(action.label()).clicked() {
+            message = run_action(ui.ctx(), host, action);
+            ui.close();
+        }
+    }
+    message
 }
 
 fn detail(ui: &mut egui::Ui, label: &str, value: &str) {
@@ -1147,5 +1348,60 @@ fn format_duration(duration: Duration) -> String {
         format!("{:.1} s", duration.as_secs_f32())
     } else {
         format!("{} ms", duration.as_millis())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{host_actions, web_url, HostAction};
+    use scanner_rs::scanner::{HostResult, ServiceRecord};
+    use std::net::Ipv4Addr;
+
+    fn host(ports: &[u16]) -> HostResult {
+        HostResult {
+            address: Ipv4Addr::new(192, 168, 1, 10),
+            reachable: true,
+            mac_address: None,
+            hostname: None,
+            services: ports
+                .iter()
+                .map(|&port| ServiceRecord {
+                    port,
+                    name: String::new(),
+                    banner: None,
+                })
+                .collect(),
+            http: None,
+            users: Vec::new(),
+            shares: Vec::new(),
+            remote_time: None,
+        }
+    }
+
+    #[test]
+    fn builds_web_urls() {
+        assert_eq!(
+            web_url(&host(&[80, 443])).as_deref(),
+            Some("http://192.168.1.10/")
+        );
+        assert_eq!(
+            web_url(&host(&[443])).as_deref(),
+            Some("https://192.168.1.10/")
+        );
+        assert_eq!(
+            web_url(&host(&[8006])).as_deref(),
+            Some("https://192.168.1.10:8006/")
+        );
+        assert_eq!(web_url(&host(&[22])), None);
+    }
+
+    #[test]
+    fn orders_actions_by_usefulness() {
+        let actions = host_actions(&host(&[22, 445, 3389]));
+        assert!(matches!(actions[0], HostAction::RemoteDesktop));
+        assert!(matches!(actions[1], HostAction::Shares));
+        assert!(matches!(actions[2], HostAction::Ssh));
+        assert!(matches!(actions[3], HostAction::CopyIp));
+        assert_eq!(actions.len(), 4);
     }
 }

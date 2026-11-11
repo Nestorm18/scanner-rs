@@ -14,6 +14,16 @@ use std::time::Duration;
 /// Ports tried during host discovery when ICMP/ARP get no answer.
 const DISCOVERY_PORTS: [u16; 5] = [445, 80, 443, 3389, 22];
 
+/// Common TCP ports checked on every live host.
+pub const DEFAULT_PORTS: [u16; 44] = [
+    21, 22, 23, 25, 53, 80, 81, 88, 110, 111, 135, 139, 143, 389, 443, 445, 465, 515, 548, 587,
+    631, 993, 995, 1433, 1521, 1883, 2049, 3306, 3389, 4899, 5000, 5432, 5900, 5985, 6379, 8000,
+    8006, 8080, 8081, 8443, 8888, 9100, 9200, 27017,
+];
+
+/// Simultaneous port connections per host.
+const PORTS_IN_FLIGHT: usize = 16;
+
 /// Maximum extra wait for DNS, MAC and Windows data once ports are scanned.
 const DETAIL_TIMEOUT: Duration = Duration::from_secs(8);
 
@@ -33,10 +43,9 @@ pub struct ScanOptions {
 
 impl Default for ScanOptions {
     fn default() -> Self {
-        let mut ports = vec![80, 21, 443, 445];
+        let mut ports = DEFAULT_PORTS.to_vec();
         ports.extend(TARGETED_METADATA_PORTS);
         ports.extend(HTTP_METADATA_PORTS);
-        ports.push(4899);
         ports.sort_unstable();
         ports.dedup();
 
@@ -321,30 +330,38 @@ fn detail_host(mut host: HostResult, options: &ScanOptions, cancelled: &AtomicBo
         .is_none()
         .then(|| run_detached(move || mac_address(address)));
 
+    let next_port = std::sync::atomic::AtomicUsize::new(0);
+    let found = Mutex::new(Vec::new());
     thread::scope(|scope| {
         let http = options
             .collect_http_metadata
             .then(|| scope.spawn(move || fetch_http_metadata(address, options)));
-        let ports: Vec<_> = options
-            .ports
-            .iter()
-            .map(|&port| {
-                scope.spawn(move || {
+        let ports: Vec<_> = (0..options.ports.len().min(PORTS_IN_FLIGHT))
+            .map(|_| {
+                scope.spawn(|| loop {
                     if cancelled.load(Ordering::Relaxed) {
-                        return None;
+                        break;
                     }
-                    let stream = connect(address, port, options.connect_timeout)?;
-                    let (name, banner) = identify_open_service(address, port, stream, options);
-                    Some(ServiceRecord { port, name, banner })
+                    let index = next_port.fetch_add(1, Ordering::Relaxed);
+                    let Some(&port) = options.ports.get(index) else {
+                        break;
+                    };
+                    if let Some(stream) = connect(address, port, options.connect_timeout) {
+                        let (name, banner) = identify_open_service(address, port, stream, options);
+                        if let Ok(mut found) = found.lock() {
+                            found.push(ServiceRecord { port, name, banner });
+                        }
+                    }
                 })
             })
             .collect();
-        host.services = ports
-            .into_iter()
-            .filter_map(|handle| handle.join().ok().flatten())
-            .collect();
+        for handle in ports {
+            let _ = handle.join();
+        }
         host.http = http.and_then(|handle| handle.join().ok().flatten());
     });
+    host.services = found.into_inner().unwrap_or_default();
+    host.services.sort_by_key(|service| service.port);
 
     let deadline = std::time::Instant::now() + DETAIL_TIMEOUT;
     fn wait<T>(receiver: mpsc::Receiver<T>, deadline: std::time::Instant) -> Option<T> {
@@ -642,17 +659,48 @@ fn service_name(port: u16) -> &'static str {
     match port {
         21 => "ftp",
         22 => "ssh",
+        23 => "telnet",
         25 => "smtp",
         53 => "dns",
         80 => "http",
+        81 => "http",
+        88 => "kerberos",
         110 => "pop3",
+        111 => "rpcbind",
+        135 => "msrpc",
         139 => "netbios-ssn",
         143 => "imap",
+        389 => "ldap",
         443 => "https",
         445 => "microsoft-ds",
+        465 => "smtps",
+        515 => "printer",
+        548 => "afp",
+        587 => "submission",
+        631 => "ipp",
+        993 => "imaps",
+        995 => "pop3s",
+        1433 => "mssql",
+        1521 => "oracle",
+        1883 => "mqtt",
+        2049 => "nfs",
+        3306 => "mysql",
         3389 => "rdp",
         4899 => "radmin",
+        5000 => "upnp",
+        5432 => "postgresql",
+        5900 => "vnc",
+        5985 => "winrm",
+        6379 => "redis",
+        8000 => "http-alt",
+        8006 => "proxmox",
         8080 => "http-alt",
+        8081 => "http-alt",
+        8443 => "https-alt",
+        8888 => "http-alt",
+        9100 => "jetdirect",
+        9200 => "elasticsearch",
+        27017 => "mongodb",
         _ => "unknown",
     }
 }

@@ -23,7 +23,9 @@
 - **Resultados al momento**: los equipos aparecen en cuanto responden y sus
   servicios se completan después.
 - **Detecta tus redes**: el rango de tu red viene puesto; las demás están en **▾**.
-- **Puertos y servicios** abiertos, título y servidor web.
+- **Puertos y servicios**: 44 puertos habituales más los que añadas (**⚙**).
+- **Acciones directas**: abrir la web, Escritorio remoto, carpetas compartidas,
+  SSH o copiar IP/MAC con doble clic o clic derecho.
 - **Fabricante** de cada equipo a partir de su MAC.
 - **Ordenar y buscar** por cualquier columna.
 - **Exportar** a HTML, CSV (Excel), XML o texto.
@@ -32,8 +34,9 @@
 
 1. Abre `scanner-rs.exe`.
 2. Pulsa **Escanear**. Para otra red o un archivo de IPs usa **▾**, o escribe
-   una IP o un rango (`192.168.1.1-192.168.1.254`).
-3. Haz clic en un equipo para ver el detalle.
+   una IP, un rango (`192.168.1.1-192.168.1.254`) o una red CIDR (`192.168.1.0/24`).
+3. Haz clic en un equipo para ver el detalle; doble clic para abrirlo (web,
+   Escritorio remoto o carpetas) y clic derecho para ver todas las acciones.
 
 | Modo     | Qué obtiene                                            |
 |----------|--------------------------------------------------------|
@@ -54,13 +57,13 @@ Con argumentos, el mismo ejecutable funciona en la terminal:
 
 | Opción      | Descripción                                               |
 |-------------|-----------------------------------------------------------|
-| `/r:`       | IPv4 o rango inclusivo                                    |
+| `/r:`       | IPv4, rango inclusivo o red CIDR                          |
 | `/s:`       | Archivo con una IP o rango por línea (`#` y `;` comentan) |
 | `/f:`       | Guarda el resultado; `.xml` selecciona formato XML        |
 | `/v`        | Servicios y metadatos HTTP                                |
 | `/v2`       | Añade usuarios, recursos compartidos y hora de Windows    |
 
-`| Out-String` hace que PowerShell espere a que termine el escaneo antes de
+Solo se muestran los equipos que responden. `| Out-String` hace que PowerShell espere a que termine el escaneo antes de
 mostrar el prompt.
 
 ## Cómo funciona
