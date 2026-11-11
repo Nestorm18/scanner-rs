@@ -15,6 +15,7 @@ use std::cmp::Ordering as CmpOrdering;
 use std::fs;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
+#[cfg(not(windows))]
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -43,7 +44,7 @@ pub fn run() -> eframe::Result<()> {
     };
     let size = Vec2::new(1040.0, 680.0);
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title("scanner-rs")
+        .with_title(concat!("scanner-rs ", env!("CARGO_PKG_VERSION")))
         .with_icon(icon)
         .with_inner_size(size)
         .with_min_inner_size([760.0, 480.0]);
@@ -1188,17 +1189,11 @@ fn web_url(host: &HostResult) -> Option<String> {
 /// Runs an action; returns a short message for the status line.
 fn run_action(context: &egui::Context, host: &HostResult, action: &HostAction) -> Option<String> {
     let address = host.address.to_string();
-    let launched = match action {
-        HostAction::Web(url) => Command::new("rundll32")
-            .args(["url.dll,FileProtocolHandler", url])
-            .spawn(),
-        HostAction::RemoteDesktop => Command::new("mstsc").arg(format!("/v:{address}")).spawn(),
-        HostAction::Shares => Command::new("explorer")
-            .arg(format!(r"\\{address}"))
-            .spawn(),
-        HostAction::Ssh => Command::new("cmd")
-            .args(["/c", "start", "", "ssh", &address])
-            .spawn(),
+    let opened = match action {
+        HostAction::Web(url) => shell_open(url, None),
+        HostAction::RemoteDesktop => shell_open("mstsc.exe", Some(&format!("/v:{address}"))),
+        HostAction::Shares => shell_open(&format!(r"\\{address}"), None),
+        HostAction::Ssh => shell_open("ssh.exe", Some(&address)),
         HostAction::CopyIp => {
             context.copy_text(address.clone());
             return Some(format!("Copiado: {address}"));
@@ -1209,9 +1204,55 @@ fn run_action(context: &egui::Context, host: &HostResult, action: &HostAction) -
             return Some(format!("Copiado: {mac}"));
         }
     };
-    launched
-        .err()
-        .map(|error| format!("No se pudo abrir: {error}"))
+    (!opened).then(|| format!("No se pudo abrir {}", action.label().to_lowercase()))
+}
+
+/// Opens a URL, path or program the same way Explorer does (`ShellExecuteW`),
+/// without going through helper processes such as `cmd` or `rundll32`.
+#[cfg(windows)]
+fn shell_open(target: &str, parameters: Option<&str>) -> bool {
+    use std::ffi::c_void;
+    use std::ptr;
+
+    #[link(name = "shell32")]
+    extern "system" {
+        fn ShellExecuteW(
+            window: *mut c_void,
+            operation: *const u16,
+            file: *const u16,
+            parameters: *const u16,
+            directory: *const u16,
+            show: i32,
+        ) -> *mut c_void;
+    }
+    const SW_SHOWNORMAL: i32 = 1;
+
+    let wide = |text: &str| text.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+    let operation = wide("open");
+    let file = wide(target);
+    let parameters = parameters.map(wide);
+    let result = unsafe {
+        ShellExecuteW(
+            ptr::null_mut(),
+            operation.as_ptr(),
+            file.as_ptr(),
+            parameters.as_ref().map_or(ptr::null(), |p| p.as_ptr()),
+            ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    // Values above 32 mean success.
+    result as isize > 32
+}
+
+#[cfg(not(windows))]
+fn shell_open(target: &str, parameters: Option<&str>) -> bool {
+    let mut command = Command::new("xdg-open");
+    command.arg(target);
+    if let Some(parameters) = parameters {
+        command.arg(parameters);
+    }
+    command.spawn().is_ok()
 }
 
 /// Context menu for a row; returns a status message when an action ran.
