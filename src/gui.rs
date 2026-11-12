@@ -12,6 +12,7 @@ use scanner_rs::source::parse_source;
 use scanner_rs::targets::{parse_ports, Ipv4Range};
 use scanner_rs::vendor;
 use std::cmp::Ordering as CmpOrdering;
+use std::env;
 use std::fs;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
@@ -59,17 +60,34 @@ pub fn run() -> eframe::Result<()> {
         }
         None => true,
     };
-    let options = eframe::NativeOptions {
-        viewport,
-        centered,
-        ..Default::default()
+    // OpenGL first; machines without OpenGL 2.0 (no GPU driver, VMs, Remote
+    // Desktop) fall back to wgpu, which uses DirectX 12 / Vulkan or WARP.
+    let launch = |renderer| {
+        let options = eframe::NativeOptions {
+            viewport: viewport.clone(),
+            centered,
+            renderer,
+            ..Default::default()
+        };
+        eframe::run_native(
+            "scanner-rs",
+            options,
+            Box::new(|context| Ok(Box::new(ScannerApp::new(context)))),
+        )
     };
-
-    eframe::run_native(
-        "scanner-rs",
-        options,
-        Box::new(|context| Ok(Box::new(ScannerApp::new(context)))),
-    )
+    match env::var("SCANNER_RENDERER").as_deref() {
+        Ok("wgpu") => return launch(eframe::Renderer::Wgpu),
+        Ok("glow") => return launch(eframe::Renderer::Glow),
+        _ => {}
+    }
+    match launch(eframe::Renderer::Glow) {
+        Err(glow_error) => launch(eframe::Renderer::Wgpu).map_err(|wgpu_error| {
+            eframe::Error::AppCreation(
+                format!("OpenGL: {glow_error} | DirectX/wgpu: {wgpu_error}").into(),
+            )
+        }),
+        ok => ok,
+    }
 }
 
 /// Primary monitor work area in logical points (before DPI awareness is set,

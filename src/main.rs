@@ -96,14 +96,77 @@ fn run_cli() -> ExitCode {
 
 fn main() -> ExitCode {
     if env::args_os().len() <= 1 {
+        install_panic_hook();
         return match gui::run() {
             Ok(()) => ExitCode::SUCCESS,
-            Err(_) => ExitCode::FAILURE,
+            Err(error) => {
+                report_startup_error(&format!("No se pudo abrir la ventana: {error}"));
+                ExitCode::FAILURE
+            }
         };
     }
     attach_parent_console();
     run_cli()
 }
+
+/// The GUI build has no console, so failures go to a log file and a message box.
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        report_startup_error(&format!("Error interno: {info}
+
+{backtrace}"));
+    }));
+}
+
+fn report_startup_error(message: &str) {
+    let log_path = env::temp_dir().join("scanner-rs.log");
+    let entry = format!(
+        "scanner-rs {} ({} {})
+{message}
+
+",
+        env!("CARGO_PKG_VERSION"),
+        env::consts::OS,
+        env::consts::ARCH,
+    );
+    let logged = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .and_then(|mut file| file.write_all(entry.as_bytes()))
+        .is_ok();
+    eprint!("{entry}");
+
+    let first_line = message.lines().next().unwrap_or(message);
+    let text = if logged {
+        format!("{first_line}
+
+Detalles guardados en:
+{}", log_path.display())
+    } else {
+        first_line.to_string()
+    };
+    show_error_box(&text);
+}
+
+#[cfg(windows)]
+fn show_error_box(text: &str) {
+    const MB_ICONERROR: u32 = 0x10;
+    #[link(name = "user32")]
+    extern "system" {
+        fn MessageBoxW(window: isize, text: *const u16, caption: *const u16, kind: u32) -> i32;
+    }
+    let wide = |value: &str| value.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+    let text = wide(text);
+    let caption = wide("scanner-rs");
+    unsafe {
+        MessageBoxW(0, text.as_ptr(), caption.as_ptr(), MB_ICONERROR);
+    }
+}
+
+#[cfg(not(windows))]
+fn show_error_box(_text: &str) {}
 
 /// Release builds use the GUI subsystem; reuse the terminal we were started from
 /// so command-line output is visible.
